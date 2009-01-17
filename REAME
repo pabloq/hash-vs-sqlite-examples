@@ -1,0 +1,200 @@
+============================================
+Función de busqueda: usando hash o sqlite3? 
+============================================
+
+Muchas veces necesitamos tener una función que devuelva varios valores usando como parámetro uno solo, la mayoría de las veces estás son pequeñas y se almacena usando hash, y si es más grande usualmente se utiliza una base de datos donde se monta una tabla con llave primaria el valor en el búsqueda (por lo tanto única).
+Este pequeño articulo no pretende predicar uno o el otro, sino mostrar su beneficios tanto en flexibilidad como en rendimiento.
+Cuando estamos hablando de grande cantidades de datos usualmente optamos por el uso de bases de datos, pero a veces estos motores salen sobrando para lo que realmente necesitamos (más ahora que la memoria RAM viene en gigas). Por esta razón se me vino a la mente sqlite que es una micro-base de datos (en su versión 3-3-6-10 pesa tan solo 206.85KiB) gratuita disponible en todos los sistemas operativos de mayor uso (linux, mac, windows).
+En este caso solo necesitamos tener los binarios accesibles y poder construir librería que manejen considerable cantidad de datos disponibles sin instalar grandes motores de base de datos para tareas simples, como por ejemplo funciones de conversiones de datos de alto costo computacional pre-computadas.
+El problema especifico se basa es la necesidad de una función que reciba un nombre de una empresa y devuelva este nombre en su versión "estandar".
+
+veamos el siguiente ejemplo:
+
+Mac Donalds
+Restaurantes Mac Donalds
+Rest Mac Donalds
+Mac Donalds S.A.
+
+La función que necesitamos recibiría estos nombres y devolvería su nombre "estandar" que sería "Mac Donalds" para todos los casos anteriores.
+Esto es muy común en limpieza de datos. En mi caso estas relaciones de estandarización fueron hechas por personas "a pata" ayudados por software.
+La herramienta utiliza estos metadatos como fuente, y se vería maso menos así:
+
+std_name('Mac Donalds') => 'Mac Donalds'
+std_name('Restaurantes Mac Donalds') => 'Mac Donalds'
+std_name('Rest Mac Donalds') => 'Mac Donalds'
+std_name('Mac Donalds S.A.') => 'Mac Donalds'
+
+Los metadatos están en un archivo CSV. Se realizaron dos versiones una usando hash's y array's en memoria y otra usando sqlite3.
+
+Estas realizan los siguientes tipos de búsqueda:
+
+    * búsqueda exacta: la versión por match exacto devuelve el standard name en donde el nombre es exactamente igual al suministrado.
+
+    * búsqueda aproximada al estilo 'like': en este caso devolverá el primer match en donde la palabra suministrada este contenida dentro del campo de búsqueda, al estilo de name "like '%campo_parametro%'”
+
+
+=================
+Versión Hash
+=================
+
+archivo: std_names_hash.rb
+STD_NAME = {}
+File.new("#{File.dirname(__FILE__)}/STD_NAMES_MASTER.csv",'r').each{|line|
+record = line.gsub(/[\n\r]/,'').split(",",-1)
+STD_NAME[record[0]]=[record[1],record[2]]
+}
+STD_NAME_FLAT = STD_NAME.to_a
+def std_names_fake_like name
+res = STD_NAME_FLAT.detect{|v| v[0] =~ Regexp.new("^.*(#{name}).*$")}
+res||=[nil,[nil,nil]]
+res[1]
+end
+
+
+La preparación del Hash es bastante simple, un simple barrido secuencial archivo e su inserción. Para simular búsquedas estilo like convertí el hash en array para poder utilizar el método detect en conjunto con expresiones regulares. El método detect devuelve el primer valor que haga match en este caso con la expresión regular "^.*(valor).*$" usando el objeto Regexp, esta expresión regular equivale al "like '%valor%'" de sql.
+
+=================
+Versión Sqlite3
+=================
+_______
+Nota: se necesita tener creada la base de datos corriendo el siente comando:
+
+~#sqlite3 test.db
+SQLite version 3.4.2
+Enter ".help" for instructions
+sqlite> .quit
+
+Le damos '.quit' para salir.
+_______
+
+archivo: std_names_sqlite3.rb
+`sqlite3 test.db "drop table std_names"`
+`sqlite3 test.db "create table std_names(std_name TEXT,bus_name TEXT,sic TEXT)"`
+`sqlite3 -separator , test.db ".import STD_NAMES_MASTER.csv std_names"`
+`sqlite3 test.db "create index au_name_idx on std_names (std_name)"`
+require 'dbi'
+@dbh = DBI.connect('DBI:SQLite3:test.db', '', '')
+def std_names name
+@dbh.select_one("select bus_name,sic from std_names where std_name = '#{name}';") rescue [nil,nil,nil]
+end
+def std_names_with_like name
+@dbh.select_one("select bus_name,sic from std_names where std_name like '%#{name}%';") rescue [nil,nil,nil]
+end
+
+
+La primera linea borra la tabla en caso de que exista, la segunda crea la tabla, la tercera inserta el archivo CSV y la cuarta crea un índice sobre la columna de búsqueda. Están definidos dos métodos, uno para búsquedas exactas y otro para busquedas utilizando like, estas dos devolviendo la primera ocurrencia que haga match.
+
+Para verificar que esta corriendo correctamente corrí cuatro variaciones de nombres de empresas que son la misma (todas deberian de tener el mismo nombre estándar de empresa) para match, y un par de ejemplo match por aproximación con un segmento del nombre de la empresa.
+
+archivo: test_run_std_names.rb
+require 'std_names_hash'
+require 'std_names_sqlite3'
+puts "exact match:"
+['SUPERCUTS 90198','SUPERCUTS 90250','SUPERCUTS 90471','SUPERCUTS 9765'].each{|business_name|
+puts "hash: #{STD_NAME[business_name][0]}"
+puts "sqlite3: #{std_names(business_name)[0]}"
+}
+puts "using like (or fake like):"
+puts "Using sqlite3:"
+puts std_names_with_like('PERCU')[0]
+puts std_names_with_like('PERCUTS 9')[0]
+puts "Using array, detect and regular expresion:"
+puts std_names_fake_like('PERCU')[0]
+puts std_names_fake_like('PERCUTS 9')[0]
+
+Después de correrlo dio los siguientes resultados:
+
+exact match:
+hash: SUPERCUTS
+sqlite3: SUPERCUTS
+hash: SUPERCUTS
+sqlite3: SUPERCUTS
+hash: SUPERCUTS
+sqlite3: SUPERCUTS
+hash: SUPERCUTS
+sqlite3: SUPERCUTS
+using like (or fake like):
+Using sqlite3:
+SUPERCUTS
+SUPERCUTS
+Using array, detect method and regular expresion:
+SUPERCUTS
+SUPERCUTS
+
+
+Hasta el momento las dos implementaciones soluciona el problema. Para medir cual de las dos solucionan mejor problema realicé pruebas de rendimiento, a tres niveles, carga de datos, match exacto y match aproximado. Esto se resume en el siguiente script.
+
+archivo: test_hash_vs_sqlite3.rb
+require 'benchmark'
+puts 'load time:'
+Benchmark.bm do |x|
+x.report("hash: ") { require 'std_names_hash'}
+x.report("sqlite3:") {require 'std_names_sqlite3'}
+end
+data = []
+File.new('test_data.csv','r').each{|line| data.push line.split('","',-1)[9] if line.split('","',-1)[9]}
+puts 'exact match:'
+Benchmark.bm do |x|
+x.report("hash: "){
+data.each{|bus_name| STD_NAME[bus_name]}
+}
+x.report("sqlite3:"){
+data.each{|bus_name| std_names bus_name}
+}
+end
+puts 'match using like:'
+Benchmark.bm do |x|
+x.report("hash: "){
+data.each{|bus_name| std_names_fake_like(bus_name)}
+}
+x.report("sqlite3:"){
+data.each{|bus_name| std_names_with_like(bus_name)}
+}
+end
+
+El primer benchmark mide el tiempo de carga en los dos casos, el recorrido secuencial para la implementación mediante hash y array, y la carga de datos a sqlite y la creación del indice sobre la tabla (con el comando: sqlite3 -separator , test.db ".import STD_NAMES_MASTER.csv std_names").
+El segundo mide el tiempo de las funciones de búsqueda "exacta" en hash y con sqlite. Para esta se utiliza datos de prueba en el archivo test_data.csv que contiene 10000 registros.
+El tercer benchmark mide el tiempo de ejecución de las funciones de busqueda con expresiones regulares para el caso del archivo y array, y el uso de la sentencia "like" en sql, para una búsqueda aproximada con un segmento del la llave. En este ulitmo caso se utilizaron 100 datos de prueba.
+Esto corrió en una Intel(R) Core(TM)2 Duo CPU T7100 @ 1.80GHz, con 2066088 kB de memoria.
+
+Estos fueron los resultados de correr el script test_hash_vs_sqlite3.rb:
+
+load time:
+user system total real
+hash: 3.500000 0.130000 3.630000 ( 3.677747)
+sqlite3: 0.360000 0.060000 5.340000 ( 21.539347)
+
+exact match (test data 10000 rows):
+user system total real
+hash: 0.020000 0.000000 0.020000 ( 0.022092)
+sqlite3: 7.260000 0.430000 7.690000 ( 7.856472)
+
+match using like (test data 100 rows):
+user system total real
+hash: 599.450000 10.640000 610.090000 (627.246236)
+sqlite3: 24.260000 2.530000 26.790000 ( 27.629173)
+
+
+======================================
+Con los resultados podemos concluir:
+======================================
+
+Funciones de búsqueda exacta:
+
+    * utilice hash definitivamente
+
+
+Función de búsqueda aproximada:
+
+    * Utilice la solución con motor de base de datos
+    * Si tiene un motor de bases de datos instalado utilicelo, sino utilice algún motor portarle, gratuito y funcionará con tiempos respuesta bastante aceptables.
+
+
+Si necesita las dos:
+
+    * combine las dos opciones para búsqueda exacta utilice hash, y para aproximadas la versión con base de datos, en serio vale la pena combinar la solución ya que los hash son invencibles en match exactos.
+
+      Otras:
+
+    * Las funciones de match exacto son realmente eficientes, los datos de prueba fueron 10000 y corrieron en 3.7 segundos es decir 2702 matcheos por segundo, para la versión de sqlite3 465.1 registros por segundo. Las funciones de match aproximado son mucho más lentas de los de prueba fueron mucho menos y duró considerablemente más que los otros tipos de match.
+    * Para el caso de la versión array-expresion regular tomó 627.2 segundos para computar 100 entradas, lo que corresponde a 0.159 por segundo, mientras que la versión sqlite con like 3.6 registros por segundo. 
